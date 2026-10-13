@@ -168,21 +168,22 @@ func install(_ t: Tool) async throws {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     var installing: Set<String> = []
-    var stopping: Set<String> = []   // 我们自己停掉的，不自动拉起
-    let prefs = UserDefaults.standard
-
-    var watchdog: Bool {
-        get { prefs.object(forKey: "watchdog") == nil || prefs.bool(forKey: "watchdog") }
-        set { prefs.set(newValue, forKey: "watchdog") }
-    }
+    var appsObserver: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
-        // 这几个工具都是 LSUIElement，NSWorkspace 不发它们的启动/退出通知，所以轮询
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
-        // 启动时把装了但没运行的工具拉起来
+        // 进程列表变化时才刷新图标，不轮询
+        appsObserver = NSWorkspace.shared.observe(\.runningApplications) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.refreshIcon() }
+        }
+        // 第一次运行默认打开开机启动；之后以用户在菜单里的选择为准
+        if !UserDefaults.standard.bool(forKey: "loginItemInitialized") {
+            try? SMAppService.mainApp.register()
+            UserDefaults.standard.set(true, forKey: "loginItemInitialized")
+        }
+        // 开机自启后，把装了但没运行的工具拉起来
         for t in tools where state(t) == .stopped { launch(t, activate: false) }
         refreshIcon()
     }
@@ -194,21 +195,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         img?.isTemplate = true
         item.button?.image = img
         item.button?.toolTip = bad ? "一键切换win：有工具没在运行" : "一键切换win"
-    }
-
-    var wasRunning: Set<String> = Set(tools.filter { runningApp($0) != nil }.map(\.bundleID))
-
-    /// 发现工具从「运行」变成「没运行」，且不是我们自己停的，就拉起来。
-    func poll() {
-        for t in tools {
-            let running = runningApp(t) != nil
-            if running { wasRunning.insert(t.bundleID); continue }
-            guard wasRunning.remove(t.bundleID) != nil else { continue }
-            if stopping.contains(t.bundleID) || !watchdog || state(t) != .stopped { continue }
-            NSLog("onekey-win: %@ 挂了，重新拉起", t.name)
-            launch(t, activate: false)
-        }
-        refreshIcon()
     }
 
     // 每次点开菜单都重建，保证状态是最新的
@@ -272,9 +258,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(action("应用 Windows 鼠标手感（LinearMouse）…", #selector(applyMousePreset), 0))
         }
         menu.addItem(.separator())
-        let wd = action("工具挂了自动重启", #selector(toggleWatchdog), 0)
-        wd.state = watchdog ? .on : .off
-        menu.addItem(wd)
         let login = action("开机启动", #selector(toggleLogin), 0)
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -302,15 +285,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func restartTool(_ t: Tool) {
         guard let app = runningApp(t) else { launch(t, activate: false); return }
-        stopping.insert(t.bundleID)
         app.terminate()
         var waited = 0.0
-        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [self] timer in
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
             waited += 0.25
             if app.isTerminated {
                 timer.invalidate()
                 launch(t, activate: false)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.stopping.remove(t.bundleID) }
             } else if waited >= 5 {
                 app.forceTerminate()
             }
@@ -367,8 +348,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert("没写进去", error.localizedDescription)
         }
     }
-
-    @objc func toggleWatchdog() { watchdog.toggle() }
 
     @objc func toggleLogin() {
         do {
